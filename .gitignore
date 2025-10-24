@@ -1,0 +1,66 @@
+# Zephyr build outputs
+build/
+build-*/
+build_*/
+
+# CMake artifacts
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Ninja build files
+.ninja_deps
+.ninja_log
+
+# Temporary configuration
+zephyr/runners.yaml
+pm.config
+partitions.yml
+
+# Binaries and intermediate objects
+*.a
+*.bin
+*.dfu
+*.elf
+*.hex
+*.lst
+*.map
+*.o
+*.obj
+
+# Logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE settings
+.vscode/
+.idea/
+.vscode-*/
+.vscode-test/
+.vscode-nrf-connect.json
+.vscode/settings.json
+.vscode/tasks.json
+.vscode/launch.json
+.vscode/extensions.json
+.vscode/c_cpp_properties.json
+.vscode/cm-tools.json
+.vscode/clangd/
+.vscode/ipch/
+.vscode/nrf-connect/
+.vscode/settings/
+.vscode/tmp/
+.vs/
+cmake-build-*/
+
+# Misc
+*.swp
+*.swo
+*.tmp
+.DS_Store
+Thumbs.db
