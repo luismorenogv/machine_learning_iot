@@ -30,6 +30,7 @@ partitions.yml
 *.map
 *.o
 *.obj
+*.zip
 
 # Logs
 *.log
