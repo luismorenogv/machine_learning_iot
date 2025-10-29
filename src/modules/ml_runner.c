@@ -73,25 +73,35 @@ static enum state current_active_state(void)
 
 static void submit_result(void)
 {
-	struct ml_result_event *evt = new_ml_result_event();
+    struct ml_result_event *evt = new_ml_result_event();
 
-	int err = ei_wrapper_get_next_classification_result(&evt->label, &evt->value, NULL);
-//vinh
-LOG_ERR("hey1 %d",err);
-	if (!err) {
-		err = ei_wrapper_get_anomaly(&evt->anomaly);
-		if(err)	LOG_ERR("No anomaly block");
-		err=ei_wrapper_get_timing(&evt->dsp_time,&evt->classification_time,&evt->anomaly_time);		
-		//vinh
-		if(err)	LOG_ERR("Error get timming");
-	}
+    /* Get label + confidence (must succeed) */
+    int err = ei_wrapper_get_next_classification_result(&evt->label, &evt->value, NULL);
+    if (err) {
+        LOG_ERR("Failed to get classification result (err: %d)", err);
+        /* Bail out; result callback already handled ML state transitions. */
+        return;
+    }
 
+    /* Try to get anomaly; if not present, mark as unavailable with -1.0f */
+    float anomaly_tmp = -1.0f;
+    err = ei_wrapper_get_anomaly(&anomaly_tmp);
+    if (err) {
+        /* No anomaly block in the model – that's OK. */
+        LOG_DBG("Anomaly not available");
+        evt->anomaly = -1.0f;            /* sentinel = not available */
+    } else {
+        evt->anomaly = anomaly_tmp;      /* real anomaly value */
+    }
 
-	__ASSERT_NO_MSG(!err);
-	ARG_UNUSED(err);
+    /* Timing info (best-effort) */
+    (void)ei_wrapper_get_timing(&evt->dsp_time,
+                                &evt->classification_time,
+                                &evt->anomaly_time);
 
-	APP_EVENT_SUBMIT(evt);
+    APP_EVENT_SUBMIT(evt);
 }
+
 
 static int buf_cleanup(void)
 {

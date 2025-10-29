@@ -218,134 +218,117 @@ static void display_ml_result(const char *label, bool force_update)
 
 //vinh
 
-static void update_ml_result(const char *label, float value,  float anomaly, int dsptime,int classification_time, int anomaly_time)
+static void update_ml_result(const char *label, float value, float anomaly,
+                             int dsptime, int classification_time, int anomaly_time)
 {
-//----vinh
-	static uint8_t adata[20]={
-		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't','s',
-		      0x08}; /* .org */
-	static uint8_t adatasize=19;
-//------
+    /* ------- Build your service-data payload (unchanged logic) ------- */
+    static uint8_t adata[64] = {
+        0xaa, 0xfe,       /* Eddystone UUID */
+        0x10,             /* Eddystone-URL frame type */
+        0x00,             /* Calibrated Tx power at 0m */
+        0x00,             /* URL Scheme Prefix */
+        'z','e','p','h','y','r','p','r','o','j','e','c','t','s',
+        0x08              /* .org */
+    };
+    static uint8_t adatasize = 19;
 
-	const char *new_label = cur_label;
-	bool increment = true;
+    /* Compose short ASCII payload: "<label>;<dsp>;<cls>;<anom>" */
+    char rs[40];
+    char snum[16];
 
-	if (anomaly > ANOMALY_THRESH) {
-		new_label = ANOMALY_LABEL;
-	} else if (value >= VALUE_THRESH) {
-		new_label = label;
-	} else {
-		increment = false;
-	}
+    rs[0] = '\0';
+    if (label) { strncat(rs, label, sizeof(rs) - 1); }
+    strncat(rs, ";", sizeof(rs) - 1);
 
-	if (new_label != cur_label) {
-		if ((!new_label || !cur_label) || strcmp(new_label, cur_label)) {
-			cur_label = new_label;
-			prediction_streak = 0;
-			//vinh
-			// static uint32_t oldtime;
-			// uint32_t duration,newtime=0;
-			// newtime=get_rtc_counter();
-			//duration=newtime-oldtime;
-			// oldtime=newtime;
-			char snum[6],rs[20];
-			strcpy(rs,cur_label);
-			strcat(rs,";");	
-			itoa((int)(dsptime), snum, 10);
-			strcat(rs,snum);
-			strcat(rs,";");
-			itoa((int)(classification_time), snum, 10);
-			strcat(rs,snum);
-			itoa((int)(anomaly_time), snum, 10);
-			strcat(rs,";");
-			strcat(rs,snum);			
+    snprintf(snum, sizeof(snum), "%d", (int)dsptime);
+    strncat(rs, snum, sizeof(rs) - 1);
+    strncat(rs, ";", sizeof(rs) - 1);
 
-			int l=strlen(rs);
-			for(int i=0;i<l;i++)
-			{
-				adata[i+5]=rs[i];
-			}
-			adatasize=5+l;
-			// for(int i=l;i<sizeof(adata)-1;i++)
-			// {
-			// 	adata[i+5]='x';
-			// }
+    snprintf(snum, sizeof(snum), "%d", (int)classification_time);
+    strncat(rs, snum, sizeof(rs) - 1);
+    strncat(rs, ";", sizeof(rs) - 1);
 
-		}
-	}
+    snprintf(snum, sizeof(snum), "%d", (int)anomaly_time);
+    strncat(rs, snum, sizeof(rs) - 1);
 
-	if (increment) {
-		prediction_streak++;
-	}
+    const int l = MIN((int)strlen(rs), (int)sizeof(adata) - 5);
+    for (int i = 0; i < l; i++) {
+        adata[i + 5] = (uint8_t)rs[i];
+    }
+    adatasize = 5 + (uint8_t)l;
 
-	if (prediction_streak >= PREDICTION_STREAK_THRESH) {
-		display_ml_result(cur_label, false);
-		clear_prediction();
-	}
-	
-//vinh
+    /* ------- Classification acceptance & LED label selection ------- */
+    /* Treat “no anomaly block” as anomaly = -1.0f (sentinel from ml_runner) */
+    const bool anomaly_available = (anomaly >= 0.0f);
 
-	static char a=1;
-	static char advstart=1;
-	static char advstop=0;
-	static char cnt=0;
-	static char cnt1=0;
+    const char *new_label = NULL;
+    bool accept = false;
 
+    if (anomaly_available && (anomaly > ANOMALY_THRESH)) {
+        new_label = ANOMALY_LABEL;
+        accept = true;
+    } else if (value >= VALUE_THRESH) {
+        new_label = label;
+        accept = true;
+    } else if (!anomaly_available) {
+        /* Requested behavior: without anomaly, low-confidence → idle/unknown. */
+        new_label = "idle";         /* or set to NULL to use the default effect */
+        accept = true;
+    } else {
+        /* Low confidence with anomaly available: ignore this frame. */
+        accept = false;
+    }
 
+    if (new_label != cur_label) {
+        if ((!new_label || !cur_label) || strcmp(new_label, cur_label)) {
+            cur_label = new_label;
+            prediction_streak = 0;
+        }
+    }
 
+    if (accept) {
+        prediction_streak++;
+    }
 
-	if (advstop==0)
-	{
-		if(cnt1++<=3) return;
-		advstop=1;
-		cnt1=0;
-		cnt=0;
-		bt_le_adv_stop();
-	}
+    if (prediction_streak >= PREDICTION_STREAK_THRESH) {
+        display_ml_result(cur_label, false);
+        clear_prediction();
+    }
 
+    /* ------- Continuous advertising: update payload, don’t stop/start ------- */
+    /* Use the existing 'ad1' + 'sd' defined earlier in this file. */
+    static bool adv_started;
+    static int64_t adv_last_update_ms;
+    const int64_t now = k_uptime_get();
+    const int64_t ADV_MIN_UPDATE_MS = 100;
+    struct bt_data svc = BT_DATA(BT_DATA_SVC_DATA16, adata, adatasize);
 
-	if(cnt++<1) return;
-	advstop=0;
-	cnt=0;
-	a++;
-	//uint8_t adata[]={0xaa,0xfe,0x10,0x00,0x00,0x30,0x30,'a','a','b','b',0x08};
-	//struct bt_data ad0=BT_DATA_BYTES(BT_DATA_SVC_DATA16, (uint8_t*)adata);
-	//struct bt_data ad0=BT_DATA(BT_DATA_SVC_DATA16,adata,sizeof(adata));
-	struct bt_data ad0=BT_DATA(BT_DATA_SVC_DATA16,adata,adatasize);
-	// switch (a%4){
-	// case 0:
-	// 		adata[6]=adata[7]=0x30;
+    if (!adv_started) {
+        ad1[2] = svc; /* service-data in the 3rd slot */
+        int err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY,
+                                  ad1, ARRAY_SIZE(ad1),
+                                  sd, ARRAY_SIZE(sd));
+        if (err) {
+            LOG_WRN("bt_le_adv_start failed (%d)", err);
+            return;
+        }
+        adv_started = true;
+        adv_last_update_ms = now;
+        return;
+    }
 
-	// 		break;
-	// case 1:
-	// 		adata[6]=adata[7]=0x31;
-
-	// 		break;
-
-	// case 2:
-	// 		adata[6]=adata[7]=0x32;
-	// 			break;
-
-	// case 3:
-	// default:
-	// 		adata[6]=adata[7]=0x33;
-	// 			break;
-	// }
-
-	ad1[2]=ad0;
-		int err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY, ad1, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));	
-	if (err) {
-		LOG_INF("Advertising failed to start (err %d)\n", err);
-		return;
-	}
-
+    if (now - adv_last_update_ms >= ADV_MIN_UPDATE_MS) {
+        ad1[2] = svc;
+        int err = bt_le_adv_update_data(ad1, ARRAY_SIZE(ad1),
+                                        sd, ARRAY_SIZE(sd));
+        if (err) {
+            LOG_WRN("bt_le_adv_update_data failed (%d)", err);
+        } else {
+            adv_last_update_ms = now;
+        }
+    }
 }
+
 
 static void validate_configuration(void)
 {
