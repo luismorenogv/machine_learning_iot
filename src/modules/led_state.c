@@ -42,6 +42,14 @@ static const struct led_effect *blocking_led_effect;
 static const char *cur_label;
 static size_t prediction_streak;
 
+/* Fixed fast non-connectable advertising (50 ms interval) */
+static const struct bt_le_adv_param *adv_fast =
+	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_USE_IDENTITY,
+			0x0050, /* interval_min = 50 ms */
+			0x0050, /* interval_max = 50 ms */
+			NULL);
+
+
 //vinh
 #define DEVICE_NAME1 "CPS22"
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME1) - 1)
@@ -300,14 +308,14 @@ static void update_ml_result(const char *label, float value, float anomaly,
     static bool adv_started;
     static int64_t adv_last_update_ms;
     const int64_t now = k_uptime_get();
-    const int64_t ADV_MIN_UPDATE_MS = 100;
+    const int64_t ADV_MIN_UPDATE_MS = 50;
     struct bt_data svc = BT_DATA(BT_DATA_SVC_DATA16, adata, adatasize);
 
     if (!adv_started) {
         ad1[2] = svc; /* service-data in the 3rd slot */
-        int err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY,
-                                  ad1, ARRAY_SIZE(ad1),
-                                  sd, ARRAY_SIZE(sd));
+		int err = bt_le_adv_start(adv_fast,
+								ad1, ARRAY_SIZE(ad1),
+								sd, ARRAY_SIZE(sd));
         if (err) {
             LOG_WRN("bt_le_adv_start failed (%d)", err);
             return;
