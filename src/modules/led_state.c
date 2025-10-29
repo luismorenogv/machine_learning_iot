@@ -45,32 +45,19 @@ static size_t prediction_streak;
 /* Fixed fast non-connectable advertising (50 ms interval) */
 static const struct bt_le_adv_param *adv_fast =
 	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_USE_IDENTITY,
-			0x0050, /* interval_min = 50 ms */
-			0x0050, /* interval_max = 50 ms */
+			0x0050, /* 50 ms */
+			0x0050, /* 50 ms */
 			NULL);
+
+static bool ble_ready;
+static bool adv_started;
+static int64_t adv_last_update_ms;
+#define ADV_MIN_UPDATE_MS 50
 
 
 //vinh
 #define DEVICE_NAME1 "CPS22"
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME1) - 1)
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0xaa, 0xfe),
-	BT_DATA_BYTES(BT_DATA_SVC_DATA16,
-		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't',
-		      0x08) /* .org */
-};
-
-static struct bt_data ad3[]={
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_MANUFACTURER_DATA, 0xfe, 0xfe)
-
-};
 
 static struct bt_data ad1[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
@@ -83,11 +70,6 @@ static struct bt_data ad1[] = {
 		      'z', 'e', 'p', 'h', 'y', 'r',
 		      'p', 'r', 'o', 'j', 'e', 'c', 't',
 		      0x08) /* .org */
-};
-/* Set Scan Response data */
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME1, DEVICE_NAME_LEN),
-	//BT_DATA(BT_DATA_NAME_SHORTENED, DEVICE_NAME1, DEVICE_NAME_LEN),
 };
 
 
@@ -102,6 +84,36 @@ uint32_t get_rtc_counter(void)
 //-----------
 
 
+static void adv_start_or_update(const uint8_t *svc_data, size_t svc_len)
+{
+	struct bt_data svc = BT_DATA(BT_DATA_SVC_DATA16, svc_data, svc_len);
+
+	if (!adv_started) {
+		if (!ble_ready) return;
+		ad1[2] = svc;
+
+		int err = bt_le_adv_start(adv_fast, ad1, ARRAY_SIZE(ad1), NULL, 0);
+		if (err) {
+			LOG_ERR("bt_le_adv_start err=%d", err);
+			return;
+		}
+		LOG_INF("Advertising started (ADV_NONCONN_IND @ 50ms)");
+		adv_started = true;
+		adv_last_update_ms = k_uptime_get();
+		return;
+	}
+
+	int64_t now = k_uptime_get();
+	if ((now - adv_last_update_ms) >= ADV_MIN_UPDATE_MS) {
+		ad1[2] = svc;
+		int err = bt_le_adv_update_data(ad1, ARRAY_SIZE(ad1), NULL, 0);
+		if (err) {
+			LOG_ERR("bt_le_adv_update_data err=%d", err);
+		} else {
+			adv_last_update_ms = now;
+		}
+	}
+}
 
 
 
@@ -240,30 +252,33 @@ static void update_ml_result(const char *label, float value, float anomaly,
     };
     static uint8_t adatasize = 19;
 
-    /* Compose short ASCII payload: "<label>;<dsp>;<cls>;<anom>" */
-    char rs[40];
-    char snum[16];
+    /* Compose "<label>;<d>;<c>;<a>" and CAP it so ADV payload stays <= 31 bytes. */
+	char rs[40];
+	char snum[16];
+	rs[0] = '\0';
+	if (label) { strncat(rs, label, sizeof(rs) - 1); }
+	strncat(rs, ";", sizeof(rs) - 1);
 
-    rs[0] = '\0';
-    if (label) { strncat(rs, label, sizeof(rs) - 1); }
-    strncat(rs, ";", sizeof(rs) - 1);
+	snprintf(snum, sizeof(snum), "%d", (int)dsptime);
+	strncat(rs, snum, sizeof(rs) - 1);
+	strncat(rs, ";", sizeof(rs) - 1);
 
-    snprintf(snum, sizeof(snum), "%d", (int)dsptime);
-    strncat(rs, snum, sizeof(rs) - 1);
-    strncat(rs, ";", sizeof(rs) - 1);
+	snprintf(snum, sizeof(snum), "%d", (int)classification_time);
+	strncat(rs, snum, sizeof(rs) - 1);
+	strncat(rs, ";", sizeof(rs) - 1);
 
-    snprintf(snum, sizeof(snum), "%d", (int)classification_time);
-    strncat(rs, snum, sizeof(rs) - 1);
-    strncat(rs, ";", sizeof(rs) - 1);
+	snprintf(snum, sizeof(snum), "%d", (int)anomaly_time);
+	strncat(rs, snum, sizeof(rs) - 1);
 
-    snprintf(snum, sizeof(snum), "%d", (int)anomaly_time);
-    strncat(rs, snum, sizeof(rs) - 1);
+	/* !! CRITICAL:  l <= 17 to guarantee 31-byte legacy ADV total size */
+	const int RS_MAX_LEN = 17;
+	const int l = MIN((int)strlen(rs), RS_MAX_LEN);
 
-    const int l = MIN((int)strlen(rs), (int)sizeof(adata) - 5);
-    for (int i = 0; i < l; i++) {
-        adata[i + 5] = (uint8_t)rs[i];
-    }
-    adatasize = 5 + (uint8_t)l;
+	for (int i = 0; i < l; i++) {
+		adata[i + 5] = (uint8_t)rs[i];
+	}
+	adatasize = 5 + (uint8_t)l;
+
 
     /* ------- Classification acceptance & LED label selection ------- */
     /* Treat “no anomaly block” as anomaly = -1.0f (sentinel from ml_runner) */
@@ -303,38 +318,7 @@ static void update_ml_result(const char *label, float value, float anomaly,
         clear_prediction();
     }
 
-    /* ------- Continuous advertising: update payload, don’t stop/start ------- */
-    /* Use the existing 'ad1' + 'sd' defined earlier in this file. */
-    static bool adv_started;
-    static int64_t adv_last_update_ms;
-    const int64_t now = k_uptime_get();
-    const int64_t ADV_MIN_UPDATE_MS = 50;
-    struct bt_data svc = BT_DATA(BT_DATA_SVC_DATA16, adata, adatasize);
-
-    if (!adv_started) {
-        ad1[2] = svc; /* service-data in the 3rd slot */
-		int err = bt_le_adv_start(adv_fast,
-								ad1, ARRAY_SIZE(ad1),
-								sd, ARRAY_SIZE(sd));
-        if (err) {
-            LOG_WRN("bt_le_adv_start failed (%d)", err);
-            return;
-        }
-        adv_started = true;
-        adv_last_update_ms = now;
-        return;
-    }
-
-    if (now - adv_last_update_ms >= ADV_MIN_UPDATE_MS) {
-        ad1[2] = svc;
-        int err = bt_le_adv_update_data(ad1, ARRAY_SIZE(ad1),
-                                        sd, ARRAY_SIZE(sd));
-        if (err) {
-            LOG_WRN("bt_le_adv_update_data failed (%d)", err);
-        } else {
-            adv_last_update_ms = now;
-        }
-    }
+	adv_start_or_update(adata, adatasize);
 }
 
 
@@ -424,23 +408,36 @@ static bool handle_ml_app_mode_event(const struct ml_app_mode_event *event)
 
 static bool handle_module_state_event(const struct module_state_event *event)
 {
-	if (check_state(event, MODULE_ID(main), MODULE_STATE_READY)) {
-		if (IS_ENABLED(CONFIG_ASSERT)) {
-			validate_configuration();
-		} else {
-			ARG_UNUSED(is_led_effect_valid);
-		}
+    if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
+        ble_ready = true;
 
-		static bool initialized;
+        /* Start broadcasting even before the first ML result. */
+        static uint8_t init_adata[] = {
+            0xaa, 0xfe, 0x10, 0x00, 0x00,
+            'i','d','l','e',';','0',';','0',';','-','1'
+        };
+        adv_start_or_update(init_adata, sizeof(init_adata));
+        return false;
+    }
 
-		__ASSERT_NO_MSG(!initialized);
-		module_set_state(MODULE_STATE_READY);
-		initialized = true;
-		ml_result_set_signin_state(true);
-	}
+    if (check_state(event, MODULE_ID(main), MODULE_STATE_READY)) {
+        if (IS_ENABLED(CONFIG_ASSERT)) {
+            validate_configuration();
+        } else {
+            ARG_UNUSED(is_led_effect_valid);
+        }
 
-	return false;
+        static bool initialized;
+        __ASSERT_NO_MSG(!initialized);
+        module_set_state(MODULE_STATE_READY);
+        initialized = true;
+        ml_result_set_signin_state(true);
+        return false;
+    }
+
+    return false;
 }
+
 
 static bool app_event_handler(const struct app_event_header *aeh)
 {
