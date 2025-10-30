@@ -68,22 +68,48 @@ static size_t last_svc_len;
 #define DEVICE_NAME1 "CPS22"
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME1) - 1)
 
+/* Advertising payload: Flags + FEAA UUID + FEAA service-data (unchanged format) */
 static struct bt_data ad1[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
+	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
 	BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0xaa, 0xfe),
 	BT_DATA_BYTES(BT_DATA_SVC_DATA16,
 		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't',
-		      0x08) /* .org */
+		      0x10,       /* Eddystone-URL frame type */
+		      0x00,       /* Calibrated Tx power at 0m */
+		      0x00,       /* URL Scheme Prefix http://www. */
+		      'z','e','p','h','y','r',
+		      'p','r','o','j','e','c','t',
+		      0x08)       /* .org */
 };
 
 
 //vinh2
 //add timer counter
+
+/* Fallback bring-up helpers */
+static void start_initial_adv(void);
+static void bt_ready_cb(int err);
+
+static void start_initial_adv(void)
+{
+	static uint8_t init_adata[] = {
+		0xaa, 0xfe, 0x10, 0x00, 0x00,
+		'i','d','l','e',';','0',';','0',';','-','1'
+	};
+	adv_start_or_update(init_adata, sizeof(init_adata));
+}
+
+static void bt_ready_cb(int err)
+{
+	if (err) {
+		LOG_ERR("bt_enable callback error: %d", err);
+		return;
+	}
+	LOG_INF("Bluetooth ready (callback)");
+	ble_ready = true;
+	start_initial_adv();
+}
+
 
 uint32_t get_rtc_counter(void)
 {
@@ -94,18 +120,24 @@ uint32_t get_rtc_counter(void)
 
 static void adv_retry_fn(struct k_work *w)
 {
-    /* Re-attempt start/update with the last service data */
-    adv_start_or_update(last_svc_buf, last_svc_len);
+	LOG_DBG("adv_retry_fn: attempt to (re)start advertising");
+	/* Re-attempt start/update with the last service data */
+	adv_start_or_update(last_svc_buf, last_svc_len);
 }
 
 static void adv_start_or_update(const uint8_t *svc_data, size_t svc_len)
 {
 	struct bt_data svc = BT_DATA(BT_DATA_SVC_DATA16, svc_data, svc_len);
 
-	/* Cache payload for retries */
 	size_t copy_len = MIN(svc_len, sizeof(last_svc_buf));
 	memcpy(last_svc_buf, svc_data, copy_len);
 	last_svc_len = copy_len;
+
+	if (!ble_ready) {
+		k_work_reschedule(&adv_retry_work, K_MSEC(120));
+		LOG_DBG("BLE not ready yet; will retry advertising");
+		return;
+	}
 
 	if (!adv_started) {
 		ad1[2] = svc;
@@ -113,7 +145,6 @@ static void adv_start_or_update(const uint8_t *svc_data, size_t svc_len)
 		int err = bt_le_adv_start(adv_fast, ad1, ARRAY_SIZE(ad1), NULL, 0);
 		if (err) {
 			if (err == -EAGAIN || err == -EBUSY) {
-				/* Controller not ready yet — try again shortly */
 				k_work_reschedule(&adv_retry_work, K_MSEC(120));
 				LOG_INF("bt_le_adv_start busy/again, will retry");
 			} else {
@@ -122,7 +153,7 @@ static void adv_start_or_update(const uint8_t *svc_data, size_t svc_len)
 			return;
 		}
 		k_work_cancel_delayable(&adv_retry_work);
-		LOG_INF("Advertising started (ADV_NONCONN_IND @ 50ms)");
+		LOG_INF("Advertising started (ADV_NONCONN_IND @ 50ms, svc_len=%d)", (int)svc_len);
 		adv_started = true;
 		adv_last_update_ms = k_uptime_get();
 		return;
@@ -144,6 +175,8 @@ static void adv_start_or_update(const uint8_t *svc_data, size_t svc_len)
 		}
 	}
 }
+
+
 
 
 
@@ -438,40 +471,48 @@ static bool handle_ml_app_mode_event(const struct ml_app_mode_event *event)
 
 static bool handle_module_state_event(const struct module_state_event *event)
 {
-    if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
-        ble_ready = true;
+	/* Preferred path: if CAF ble_state reports READY, we mark ready and start ADV */
+	if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
+		LOG_INF("ble_state READY");
+		ble_ready = true;
+		start_initial_adv();
+		return false;
+	}
 
-        static uint8_t init_adata[] = {
-            0xaa, 0xfe, 0x10, 0x00, 0x00,
-            'i','d','l','e',';','0',';','0',';','-','1'
-        };
-        adv_start_or_update(init_adata, sizeof(init_adata));
-        return false;
-    }
+	/* Main became READY: finalize our own init and also try to bring up BT if needed */
+	if (check_state(event, MODULE_ID(main), MODULE_STATE_READY)) {
+		if (IS_ENABLED(CONFIG_ASSERT)) {
+			validate_configuration();
+		} else {
+			ARG_UNUSED(is_led_effect_valid);
+		}
 
-    if (check_state(event, MODULE_ID(main), MODULE_STATE_READY)) {
-        if (IS_ENABLED(CONFIG_ASSERT)) {
-            validate_configuration();
-        } else {
-            ARG_UNUSED(is_led_effect_valid);
-        }
-
-        static bool initialized;
+		static bool initialized;
 		__ASSERT_NO_MSG(!initialized);
 		module_set_state(MODULE_STATE_READY);
 		initialized = true;
+
+		/* Sign in so ml_runner knows someone listens to results */
 		ml_result_set_signin_state(true);
 
-		/* Kick initial ADV (will auto-retry until controller is ready) */
-		static uint8_t init_adata[] = {
-			0xaa, 0xfe, 0x10, 0x00, 0x00, 'i','d','l','e',';','0',';','0',';','-','1'
-		};
-		adv_start_or_update(init_adata, sizeof(init_adata));
-		return false;
-    }
+		/* Fallback: enable BT ourselves in case CAF ble_state is not present/ready */
+		int err = bt_enable(bt_ready_cb);
+		if (err == -EALREADY) {
+			LOG_INF("Bluetooth already enabled");
+			ble_ready = true;
+			start_initial_adv();
+		} else if (err) {
+			LOG_ERR("bt_enable error: %d", err);
+		}
 
-    return false;
+		/* Do NOT start advertising here directly; bt_ready_cb/start_initial_adv will */
+		return false;
+	}
+
+	return false;
 }
+
+
 
 static bool app_event_handler(const struct app_event_header *aeh)
 {
