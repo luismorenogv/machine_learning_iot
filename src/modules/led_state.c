@@ -5,6 +5,7 @@
  */
 
 #include <zephyr/kernel.h>
+#include <zephyr/init.h>
 
 #include "led_state_def.h"
 
@@ -110,6 +111,22 @@ static void bt_ready_cb(int err)
 	start_initial_adv();
 }
 
+static int led_ble_sysinit(const struct device *unused)
+{
+	ARG_UNUSED(unused);
+	int err = bt_enable(bt_ready_cb);
+	if (err == -EALREADY) {
+		LOG_INF("Bluetooth already enabled (SYS_INIT)");
+		ble_ready = true;
+		start_initial_adv();
+	} else if (err) {
+		LOG_ERR("bt_enable (SYS_INIT) err=%d", err);
+	}
+	return 0;
+}
+SYS_INIT(led_ble_sysinit, APPLICATION, 50);
+
+
 
 uint32_t get_rtc_counter(void)
 {
@@ -129,52 +146,66 @@ static void adv_start_or_update(const uint8_t *svc_data, size_t svc_len)
 {
 	struct bt_data svc = BT_DATA(BT_DATA_SVC_DATA16, svc_data, svc_len);
 
+	/* cache payload for retries */
 	size_t copy_len = MIN(svc_len, sizeof(last_svc_buf));
 	memcpy(last_svc_buf, svc_data, copy_len);
 	last_svc_len = copy_len;
 
 	if (!ble_ready) {
-		k_work_reschedule(&adv_retry_work, K_MSEC(120));
+		k_work_reschedule(&adv_retry_work, K_MSEC(150));
 		LOG_DBG("BLE not ready yet; will retry advertising");
 		return;
 	}
 
 	if (!adv_started) {
 		ad1[2] = svc;
-
 		int err = bt_le_adv_start(adv_fast, ad1, ARRAY_SIZE(ad1), NULL, 0);
 		if (err) {
 			if (err == -EAGAIN || err == -EBUSY) {
-				k_work_reschedule(&adv_retry_work, K_MSEC(120));
-				LOG_INF("bt_le_adv_start busy/again, will retry");
+				k_work_reschedule(&adv_retry_work, K_MSEC(150));
+				LOG_WRN("bt_le_adv_start busy/again (err=%d), will retry", err);
 			} else {
 				LOG_ERR("bt_le_adv_start err=%d", err);
 			}
 			return;
 		}
 		k_work_cancel_delayable(&adv_retry_work);
-		LOG_INF("Advertising started (ADV_NONCONN_IND @ 50ms, svc_len=%d)", (int)svc_len);
+		LOG_INF("Advertising started (LEGACY NONCONN @ 50 ms), svc_len=%d", (int)svc_len);
 		adv_started = true;
 		adv_last_update_ms = k_uptime_get();
 		return;
 	}
 
+	/* already advertising: try to update, else stop/start */
 	int64_t now = k_uptime_get();
-	if ((now - adv_last_update_ms) >= ADV_MIN_UPDATE_MS) {
-		ad1[2] = svc;
-		int err = bt_le_adv_update_data(ad1, ARRAY_SIZE(ad1), NULL, 0);
-		if (err) {
-			if (err == -EAGAIN || err == -EBUSY) {
-				k_work_reschedule(&adv_retry_work, K_MSEC(120));
-				LOG_DBG("bt_le_adv_update_data busy/again, will retry");
-			} else {
-				LOG_ERR("bt_le_adv_update_data err=%d", err);
-			}
-		} else {
-			adv_last_update_ms = now;
-		}
+	if ((now - adv_last_update_ms) < ADV_MIN_UPDATE_MS) {
+		return; /* throttle */
 	}
+
+	ad1[2] = svc;
+	int err = bt_le_adv_update_data(ad1, ARRAY_SIZE(ad1), NULL, 0);
+	if (!err) {
+		adv_last_update_ms = now;
+		return;
+	}
+
+	if (err == -EAGAIN || err == -EBUSY) {
+		k_work_reschedule(&adv_retry_work, K_MSEC(150));
+		LOG_DBG("bt_le_adv_update_data busy/again, will retry");
+		return;
+	}
+
+	if (err == -ENOTSUP) {
+		LOG_WRN("update_data not supported; restarting advertising");
+		bt_le_adv_stop();
+		adv_started = false;
+		k_work_reschedule(&adv_retry_work, K_NO_WAIT);
+		return;
+	}
+
+	LOG_ERR("bt_le_adv_update_data err=%d", err);
 }
+
 
 
 
@@ -471,15 +502,15 @@ static bool handle_ml_app_mode_event(const struct ml_app_mode_event *event)
 
 static bool handle_module_state_event(const struct module_state_event *event)
 {
-	/* Preferred path: if CAF ble_state reports READY, we mark ready and start ADV */
+#ifdef CONFIG_CAF_BLE_STATE
 	if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
 		LOG_INF("ble_state READY");
 		ble_ready = true;
 		start_initial_adv();
 		return false;
 	}
+#endif
 
-	/* Main became READY: finalize our own init and also try to bring up BT if needed */
 	if (check_state(event, MODULE_ID(main), MODULE_STATE_READY)) {
 		if (IS_ENABLED(CONFIG_ASSERT)) {
 			validate_configuration();
@@ -492,20 +523,20 @@ static bool handle_module_state_event(const struct module_state_event *event)
 		module_set_state(MODULE_STATE_READY);
 		initialized = true;
 
-		/* Sign in so ml_runner knows someone listens to results */
+		/* tell ml_runner we listen for results (so it starts running) */
 		ml_result_set_signin_state(true);
 
-		/* Fallback: enable BT ourselves in case CAF ble_state is not present/ready */
-		int err = bt_enable(bt_ready_cb);
-		if (err == -EALREADY) {
-			LOG_INF("Bluetooth already enabled");
-			ble_ready = true;
-			start_initial_adv();
-		} else if (err) {
-			LOG_ERR("bt_enable error: %d", err);
+		/* If BT wasn’t enabled yet by SYS_INIT (rare), try here too */
+		if (!ble_ready) {
+			int err = bt_enable(bt_ready_cb);
+			if (err == -EALREADY) {
+				LOG_INF("Bluetooth already enabled (module_state)");
+				ble_ready = true;
+				start_initial_adv();
+			} else if (err) {
+				LOG_ERR("bt_enable (module_state) err=%d", err);
+			}
 		}
-
-		/* Do NOT start advertising here directly; bt_ready_cb/start_initial_adv will */
 		return false;
 	}
 

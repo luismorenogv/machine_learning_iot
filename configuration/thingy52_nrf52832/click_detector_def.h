@@ -16,9 +16,18 @@
  */
 const struct {} click_detector_def_include_once;
 
+/* Fallback: if CONFIG_ML_APP_MODE_CONTROL_BUTTON_ID is not defined (because the
+ * EI forwarder is disabled), use 0xFFFF so no real button triggers anything.
+ */
+#ifdef CONFIG_ML_APP_MODE_CONTROL_BUTTON_ID
+#define MODE_BTN_ID CONFIG_ML_APP_MODE_CONTROL_BUTTON_ID
+#else
+#define MODE_BTN_ID 0xffff
+#endif
+
 static const struct click_detector_config click_detector_config[] = {
 	{
-		.key_id = CONFIG_ML_APP_MODE_CONTROL_BUTTON_ID,
+		.key_id = MODE_BTN_ID,
 		.consume_button_event = true,
 	},
 };
