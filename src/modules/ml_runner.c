@@ -81,6 +81,7 @@ LOG_ERR("hey1 %d",err);
 	if (!err) {
 		err = ei_wrapper_get_anomaly(&evt->anomaly);
 		if(err)	LOG_ERR("No anomaly block");
+		err=ei_wrapper_get_timing(&evt->dsp_time,&evt->classification_time,&evt->anomaly_time);		
 		//vinh
 		if(err)	LOG_ERR("Error get timming");
 	}
