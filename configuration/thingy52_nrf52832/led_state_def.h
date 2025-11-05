@@ -48,27 +48,16 @@ static const struct ml_result_led_effect ml_result_led_effects[] = {
 		.effect = LED_EFFECT_LED_ON(LED_COLOR(255, 255, 255)),
 	},
 	{
-		.label = "zoom_in",
-		.effect = LED_EFFECT_LED_ON(LED_COLOR(255, 0, 0)),
-	},
-	{
-		.label = "zoom_out",
-		.effect = LED_EFFECT_LED_ON(LED_COLOR(0, 0, 255)),
-	},
-	{
 		.label = "rot_left",
 		.effect = LED_EFFECT_LED_ON(LED_COLOR(0, 255, 0)),
 	},
 	{
 		.label = "rot_right",
-		.effect = LED_EFFECT_LED_ON(LED_COLOR(127, 0, 127)),
+		.effect = LED_EFFECT_LED_ON(LED_COLOR(255, 0, 0)),
 	},
 	{
-		.label = "move_left",
-		.effect = LED_EFFECT_LED_ON(LED_COLOR(127, 127, 127)),
-	},
-	{
-		.label = "move_right",
-		.effect = LED_EFFECT_LED_ON(LED_COLOR(127, 255, 127)),
+		.label = "left_right",
+		.effect = LED_EFFECT_LED_ON(LED_COLOR(0, 0, 255)),
 	},
 };
+
