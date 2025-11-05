@@ -17,7 +17,8 @@
 #define MODULE led_state
 #include <caf/events/module_state_event.h>
 #include <zephyr/bluetooth/bluetooth.h>
-#include "string.h"
+#include <stdio.h>   // for snprintf
+#include <string.h>  // for memcpy, strcmp
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(MODULE, CONFIG_ML_APP_LED_STATE_LOG_LEVEL);
 
@@ -218,134 +219,103 @@ static void display_ml_result(const char *label, bool force_update)
 
 //vinh
 
-static void update_ml_result(const char *label, float value,  float anomaly, int dsptime,int classification_time, int anomaly_time)
+static void update_ml_result(const char *label,
+                             float value,
+                             float anomaly,
+                             int dsp_time,
+                             int classification_time,
+                             int anomaly_time)
 {
-//----vinh
-	static uint8_t adata[20]={
-		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't','s',
-		      0x08}; /* .org */
-	static uint8_t adatasize=19;
-//------
+    /* Shared Eddystone service-data buffer:
+     * 0–1: UUID (0xaa, 0xfe)
+     * 2  : frame type (0x10)
+     * 3  : Tx power
+     * 4  : URL prefix
+     * 5+: payload we fill with "label;dsp;cls;anom"
+     */
+    static uint8_t svc_data[32] = {
+        0xaa, 0xfe, 0x10, 0x00, 0x00,
+    };
+    static uint8_t svc_data_len = 5;
 
-	const char *new_label = cur_label;
-	bool increment = true;
+    const char *new_label = cur_label;
+    bool increment = true;
 
-	if (anomaly > ANOMALY_THRESH) {
-		new_label = ANOMALY_LABEL;
-	} else if (value >= VALUE_THRESH) {
-		new_label = label;
-	} else {
-		increment = false;
-	}
+    if (anomaly > ANOMALY_THRESH) {
+        new_label = ANOMALY_LABEL;
+    } else if (value >= VALUE_THRESH) {
+        new_label = label;
+    } else {
+        increment = false;
+    }
 
-	if (new_label != cur_label) {
-		if ((!new_label || !cur_label) || strcmp(new_label, cur_label)) {
-			cur_label = new_label;
-			prediction_streak = 0;
-			//vinh
-			// static uint32_t oldtime;
-			// uint32_t duration,newtime=0;
-			// newtime=get_rtc_counter();
-			//duration=newtime-oldtime;
-			// oldtime=newtime;
-			char snum[6],rs[20];
-			strcpy(rs,cur_label);
-			strcat(rs,";");	
-			itoa((int)(dsptime), snum, 10);
-			strcat(rs,snum);
-			strcat(rs,";");
-			itoa((int)(classification_time), snum, 10);
-			strcat(rs,snum);
-			itoa((int)(anomaly_time), snum, 10);
-			strcat(rs,";");
-			strcat(rs,snum);			
+    if (new_label != cur_label) {
+        if ((!new_label || !cur_label) || strcmp(new_label, cur_label) != 0) {
+            cur_label = new_label;
+            prediction_streak = 0;
 
-			int l=strlen(rs);
-			for(int i=0;i<l;i++)
-			{
-				adata[i+5]=rs[i];
-			}
-			adatasize=5+l;
-			// for(int i=l;i<sizeof(adata)-1;i++)
-			// {
-			// 	adata[i+5]='x';
-			// }
+            if (cur_label) {
+                char payload[24];  // max 24 chars for "label;d;d;d"
 
-		}
-	}
+                int written = snprintf(payload, sizeof(payload),
+                                       "%s;%d;%d;%d",
+                                       cur_label,
+                                       dsp_time,
+                                       classification_time,
+                                       anomaly_time);
+                if (written < 0) {
+                    written = 0;
+                } else if (written > (int)sizeof(payload)) {
+                    written = sizeof(payload);
+                }
 
-	if (increment) {
-		prediction_streak++;
-	}
+                memcpy(&svc_data[5], payload, (size_t)written);
+                svc_data_len = 5 + (uint8_t)written;
+            }
+        }
+    }
 
-	if (prediction_streak >= PREDICTION_STREAK_THRESH) {
-		display_ml_result(cur_label, false);
-		clear_prediction();
-	}
-	
-//vinh
+    if (increment) {
+        prediction_streak++;
+    }
 
-	static char a=1;
-	static char advstart=1;
-	static char advstop=0;
-	static char cnt=0;
-	static char cnt1=0;
+    if (prediction_streak >= PREDICTION_STREAK_THRESH) {
+        display_ml_result(cur_label, false);
+        clear_prediction();
+    }
 
+    /* --- Advertising update (reuse your existing pattern) --- */
 
+    static bool adv_stopped_once;
+    static uint8_t cnt = 0;
+    static uint8_t cnt1 = 0;
 
+    if (!adv_stopped_once) {
+        if (cnt1++ <= 3) {
+            return;
+        }
+        adv_stopped_once = true;
+        cnt1 = 0;
+        cnt = 0;
+        (void)bt_le_adv_stop();
+    }
 
-	if (advstop==0)
-	{
-		if(cnt1++<=3) return;
-		advstop=1;
-		cnt1=0;
-		cnt=0;
-		bt_le_adv_stop();
-	}
+    if (cnt++ < 1) {
+        return;
+    }
+    cnt = 0;
 
+    struct bt_data ad0 = BT_DATA(BT_DATA_SVC_DATA16, svc_data, svc_data_len);
+    ad1[2] = ad0;
 
-	if(cnt++<1) return;
-	advstop=0;
-	cnt=0;
-	a++;
-	//uint8_t adata[]={0xaa,0xfe,0x10,0x00,0x00,0x30,0x30,'a','a','b','b',0x08};
-	//struct bt_data ad0=BT_DATA_BYTES(BT_DATA_SVC_DATA16, (uint8_t*)adata);
-	//struct bt_data ad0=BT_DATA(BT_DATA_SVC_DATA16,adata,sizeof(adata));
-	struct bt_data ad0=BT_DATA(BT_DATA_SVC_DATA16,adata,adatasize);
-	// switch (a%4){
-	// case 0:
-	// 		adata[6]=adata[7]=0x30;
-
-	// 		break;
-	// case 1:
-	// 		adata[6]=adata[7]=0x31;
-
-	// 		break;
-
-	// case 2:
-	// 		adata[6]=adata[7]=0x32;
-	// 			break;
-
-	// case 3:
-	// default:
-	// 		adata[6]=adata[7]=0x33;
-	// 			break;
-	// }
-
-	ad1[2]=ad0;
-		int err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY, ad1, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));	
-	if (err) {
-		LOG_INF("Advertising failed to start (err %d)\n", err);
-		return;
-	}
-
+    int err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY,
+                              ad1, ARRAY_SIZE(ad),
+                              sd, ARRAY_SIZE(sd));
+    if (err) {
+        LOG_INF("Advertising failed to start (err %d)", err);
+    }
 }
+
 
 static void validate_configuration(void)
 {
@@ -371,14 +341,17 @@ static void validate_configuration(void)
 
 static bool handle_ml_result_event(const struct ml_result_event *event)
 {
-	if ((ml_app_mode == ML_APP_MODE_MODEL_RUNNING) && !blocking_led_effect) {
-		//vinh 
-		//update_ml_result(event->label, event->value, event->anomaly);
-		update_ml_result(event->label, event->value,event->anomaly,event->dsp_time,event->classification_time,event->anomaly_time);
-	}
-
-	return false;
+    if ((ml_app_mode == ML_APP_MODE_MODEL_RUNNING) && !blocking_led_effect) {
+        update_ml_result(event->label,
+                         event->value,
+                         event->anomaly,
+                         event->dsp_time,
+                         event->classification_time,
+                         event->anomaly_time);
+    }
+    return false;
 }
+
 
 static bool handle_sensor_sim_event(const struct sensor_sim_event *event)
 {
