@@ -39,9 +39,9 @@ struct ml_result_event {
 	float anomaly;
 
 	//vinh
-	int dsp_time;
-	int classification_time;
-	int anomaly_time;
+	// int dsp_time;
+	// int classification_time;
+	// int anomaly_time;
 };
 
 /** @brief Sign in event

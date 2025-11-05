@@ -16,228 +16,153 @@
 
 #define MODULE led_state
 #include <caf/events/module_state_event.h>
-#include <zephyr/bluetooth/bluetooth.h>
-#include <stdio.h>   // for snprintf
-#include <string.h>  // for memcpy, strcmp
+
+#include <string.h>
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(MODULE, CONFIG_ML_APP_LED_STATE_LOG_LEVEL);
 
-#define DISPLAY_ML_RESULTS		IS_ENABLED(CONFIG_ML_APP_ML_RESULT_EVENTS)
-#define DISPLAY_SIM_SIGNAL		IS_ENABLED(CONFIG_ML_APP_SENSOR_SIM_EVENTS)
-#define DISPLAY_DATA_FORWARDER		IS_ENABLED(CONFIG_ML_APP_EI_DATA_FORWARDER_EVENTS)
+#define DISPLAY_ML_RESULTS        IS_ENABLED(CONFIG_ML_APP_ML_RESULT_EVENTS)
+#define DISPLAY_SIM_SIGNAL        IS_ENABLED(CONFIG_ML_APP_SENSOR_SIM_EVENTS)
+#define DISPLAY_DATA_FORWARDER    IS_ENABLED(CONFIG_ML_APP_EI_DATA_FORWARDER_EVENTS)
 
-#define ANOMALY_THRESH			(CONFIG_ML_APP_LED_STATE_ANOMALY_THRESH / 1000.0)
-#define VALUE_THRESH			(CONFIG_ML_APP_LED_STATE_VALUE_THRESH / 1000.0)
-#define PREDICTION_STREAK_THRESH	CONFIG_ML_APP_LED_STATE_PREDICTION_STREAK_THRESH
+#define ANOMALY_THRESH            (CONFIG_ML_APP_LED_STATE_ANOMALY_THRESH / 1000.0)
+#define VALUE_THRESH              (CONFIG_ML_APP_LED_STATE_VALUE_THRESH / 1000.0)
+#define PREDICTION_STREAK_THRESH  CONFIG_ML_APP_LED_STATE_PREDICTION_STREAK_THRESH
 
 BUILD_ASSERT(PREDICTION_STREAK_THRESH > 0);
 
-#define DEFAULT_EFFECT			(&ml_result_led_effects[0])
+#define DEFAULT_EFFECT            (&ml_result_led_effects[0])
 
 static enum ml_app_mode ml_app_mode = ML_APP_MODE_COUNT;
 static enum ei_data_forwarder_state forwarder_state = DISPLAY_DATA_FORWARDER ?
-	EI_DATA_FORWARDER_STATE_DISCONNECTED : EI_DATA_FORWARDER_STATE_TRANSMITTING;
+    EI_DATA_FORWARDER_STATE_DISCONNECTED : EI_DATA_FORWARDER_STATE_TRANSMITTING;
 
 static const struct led_effect *blocking_led_effect;
 
 static const char *cur_label;
 static size_t prediction_streak;
 
-//vinh
-#define DEVICE_NAME1 "CPS22"
-#define DEVICE_NAME_LEN (sizeof(DEVICE_NAME1) - 1)
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0xaa, 0xfe),
-	BT_DATA_BYTES(BT_DATA_SVC_DATA16,
-		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't',
-		      0x08) /* .org */
-};
-
-static struct bt_data ad3[]={
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_MANUFACTURER_DATA, 0xfe, 0xfe)
-
-};
-
-static struct bt_data ad1[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0xaa, 0xfe),
-	BT_DATA_BYTES(BT_DATA_SVC_DATA16,
-		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't',
-		      0x08) /* .org */
-};
-/* Set Scan Response data */
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME1, DEVICE_NAME_LEN),
-	//BT_DATA(BT_DATA_NAME_SHORTENED, DEVICE_NAME1, DEVICE_NAME_LEN),
-};
-
-
-//vinh2
-//add timer counter
-
-uint32_t get_rtc_counter(void)
-{
-    return NRF_RTC0->COUNTER;
-}
-
-//-----------
-
-
-
-
-
 static bool is_led_effect_valid(const struct led_effect *le)
 {
-	const uint8_t zeros[sizeof(struct led_effect)] = {0};
+    const uint8_t zeros[sizeof(struct led_effect)] = {0};
 
-	return memcmp(le, zeros, sizeof(struct led_effect));
+    return memcmp(le, zeros, sizeof(struct led_effect));
 }
 
 static bool is_led_effect_blocking(const struct led_effect *le)
 {
-	return ((!le->loop_forever) && (le->step_count > 1));
+    return ((!le->loop_forever) && (le->step_count > 1));
 }
 
 static void clear_prediction(void)
 {
-	cur_label = NULL;
-	prediction_streak = 0;
+    cur_label = NULL;
+    prediction_streak = 0;
 }
 
 static void send_led_event(size_t led_id, const struct led_effect *led_effect)
 {
-	__ASSERT_NO_MSG(led_effect);
-	__ASSERT_NO_MSG(led_id < LED_ID_COUNT);
+    __ASSERT_NO_MSG(led_effect);
+    __ASSERT_NO_MSG(led_id < LED_ID_COUNT);
 
-	struct led_event *event = new_led_event();
+    struct led_event *event = new_led_event();
 
-	event->led_id = led_id;
-	event->led_effect = led_effect;
-	APP_EVENT_SUBMIT(event);
+    event->led_id = led_id;
+    event->led_effect = led_effect;
+    APP_EVENT_SUBMIT(event);
 }
 
 static const struct ml_result_led_effect *get_led_effect(const char *label)
 {
-	const struct ml_result_led_effect *result = DEFAULT_EFFECT;
+    const struct ml_result_led_effect *result = DEFAULT_EFFECT;
 
-	if (!label) {
-		return result;
-	}
+    if (!label) {
+        return result;
+    }
 
-	for (size_t i = 1; i < ARRAY_SIZE(ml_result_led_effects); i++) {
-		const struct ml_result_led_effect *t = &ml_result_led_effects[i];
+    for (size_t i = 1; i < ARRAY_SIZE(ml_result_led_effects); i++) {
+        const struct ml_result_led_effect *t = &ml_result_led_effects[i];
 
-		if ((t->label == label) || !strcmp(t->label, label)) {
-			result = t;
-			break;
-		}
-	}
+        if ((t->label == label) || !strcmp(t->label, label)) {
+            result = t;
+            break;
+        }
+    }
 
-	return result;
+    return result;
 }
 
 static void ml_result_set_signin_state(bool state)
 {
-	struct ml_result_signin_event *event = new_ml_result_signin_event();
+    struct ml_result_signin_event *event = new_ml_result_signin_event();
 
-	event->module_idx = MODULE_IDX(MODULE);
-	event->state = state;
-	APP_EVENT_SUBMIT(event);
-	LOG_INF("Currently %s result event", state ? "signed in" : "signed off from");
+    event->module_idx = MODULE_IDX(MODULE);
+    event->state = state;
+    APP_EVENT_SUBMIT(event);
+    LOG_INF("Currently %s result event", state ? "signed in" : "signed off from");
 }
 
 static void display_sensor_sim(const char *label)
 {
-	static const struct ml_result_led_effect *sensor_sim_effect;
+    static const struct ml_result_led_effect *sensor_sim_effect;
 
-	if (label) {
-		sensor_sim_effect = get_led_effect(label);
+    if (label) {
+        sensor_sim_effect = get_led_effect(label);
 
-		if (sensor_sim_effect == DEFAULT_EFFECT) {
-			LOG_WRN("No LED effect for sensor_sim label %s", label);
-		}
-	}
+        if (sensor_sim_effect == DEFAULT_EFFECT) {
+            LOG_WRN("No LED effect for sensor_sim label %s", label);
+        }
+    }
 
-	if (sensor_sim_effect) {
-		__ASSERT_NO_MSG(!is_led_effect_blocking(&sensor_sim_effect->effect));
-		send_led_event(led_map[LED_ID_SENSOR_SIM], &sensor_sim_effect->effect);
-	}
+    if (sensor_sim_effect) {
+        __ASSERT_NO_MSG(!is_led_effect_blocking(&sensor_sim_effect->effect));
+        send_led_event(led_map[LED_ID_SENSOR_SIM], &sensor_sim_effect->effect);
+    }
 }
 
 static void display_ml_result(const char *label, bool force_update)
 {
-	__ASSERT_NO_MSG(ml_app_mode == ML_APP_MODE_MODEL_RUNNING);
+    __ASSERT_NO_MSG(ml_app_mode == ML_APP_MODE_MODEL_RUNNING);
 
-	static const struct ml_result_led_effect *ml_result_effect;
-	const struct ml_result_led_effect *new_effect = get_led_effect(label);
+    static const struct ml_result_led_effect *ml_result_effect;
+    const struct ml_result_led_effect *new_effect = get_led_effect(label);
 
-	/* Update not needed. */
-	if ((ml_result_effect == new_effect) && !force_update) {
-		return;
-	}
+    /* Update not needed. */
+    if ((ml_result_effect == new_effect) && !force_update) {
+        return;
+    }
 
-	__ASSERT_NO_MSG(!force_update || !label);
+    __ASSERT_NO_MSG(!force_update || !label);
 
-	if (!force_update) {
-		if (!label) {
-			LOG_INF("Anomaly detected");
-		} else if (new_effect == DEFAULT_EFFECT) {
-			LOG_INF("No LED effect for label: %s", label);
-		} else {
-			LOG_INF("Displaying LED effect for label: %s", label);
-		}
-	}
+    if (!force_update) {
+        if (!label) {
+            LOG_INF("Anomaly detected");
+        } else if (new_effect == DEFAULT_EFFECT) {
+            LOG_INF("No LED effect for label: %s", label);
+        } else {
+            LOG_INF("Displaying LED effect for label: %s", label);
+        }
+    }
 
-	/* Synchronize LED effect displayed for simulated signal. */
-	if (DISPLAY_SIM_SIGNAL && (new_effect != DEFAULT_EFFECT)) {
-		display_sensor_sim(NULL);
-	}
+    /* Synchronize LED effect displayed for simulated signal. */
+    if (DISPLAY_SIM_SIGNAL && (new_effect != DEFAULT_EFFECT)) {
+        display_sensor_sim(NULL);
+    }
 
-	ml_result_effect = new_effect;
-	send_led_event(led_map[LED_ID_ML_STATE], &ml_result_effect->effect);
+    ml_result_effect = new_effect;
+    send_led_event(led_map[LED_ID_ML_STATE], &ml_result_effect->effect);
 
-	if (is_led_effect_blocking(&ml_result_effect->effect)) {
-		blocking_led_effect = &ml_result_effect->effect;
-		ml_result_set_signin_state(false);
-	} else {
-		blocking_led_effect = NULL;
-		ml_result_set_signin_state(true);
-	}
+    if (is_led_effect_blocking(&ml_result_effect->effect)) {
+        blocking_led_effect = &ml_result_effect->effect;
+        ml_result_set_signin_state(false);
+    } else {
+        blocking_led_effect = NULL;
+        ml_result_set_signin_state(true);
+    }
 }
 
-//vinh
-
-static void update_ml_result(const char *label,
-                             float value,
-                             float anomaly,
-                             int dsp_time,
-                             int classification_time,
-                             int anomaly_time)
+static void update_ml_result(const char *label, float value, float anomaly)
 {
-    /* Shared Eddystone service-data buffer:
-     * 0–1: UUID (0xaa, 0xfe)
-     * 2  : frame type (0x10)
-     * 3  : Tx power
-     * 4  : URL prefix
-     * 5+: payload we fill with "label;dsp;cls;anom"
-     */
-    static uint8_t svc_data[32] = {
-        0xaa, 0xfe, 0x10, 0x00, 0x00,
-    };
-    static uint8_t svc_data_len = 5;
-
     const char *new_label = cur_label;
     bool increment = true;
 
@@ -253,25 +178,6 @@ static void update_ml_result(const char *label,
         if ((!new_label || !cur_label) || strcmp(new_label, cur_label) != 0) {
             cur_label = new_label;
             prediction_streak = 0;
-
-            if (cur_label) {
-                char payload[24];  // max 24 chars for "label;d;d;d"
-
-                int written = snprintf(payload, sizeof(payload),
-                                       "%s;%d;%d;%d",
-                                       cur_label,
-                                       dsp_time,
-                                       classification_time,
-                                       anomaly_time);
-                if (written < 0) {
-                    written = 0;
-                } else if (written > (int)sizeof(payload)) {
-                    written = sizeof(payload);
-                }
-
-                memcpy(&svc_data[5], payload, (size_t)written);
-                svc_data_len = 5 + (uint8_t)written;
-            }
         }
     }
 
@@ -283,180 +189,143 @@ static void update_ml_result(const char *label,
         display_ml_result(cur_label, false);
         clear_prediction();
     }
-
-    /* --- Advertising update (reuse your existing pattern) --- */
-
-    static bool adv_stopped_once;
-    static uint8_t cnt = 0;
-    static uint8_t cnt1 = 0;
-
-    if (!adv_stopped_once) {
-        if (cnt1++ <= 3) {
-            return;
-        }
-        adv_stopped_once = true;
-        cnt1 = 0;
-        cnt = 0;
-        (void)bt_le_adv_stop();
-    }
-
-    if (cnt++ < 1) {
-        return;
-    }
-    cnt = 0;
-
-    struct bt_data ad0 = BT_DATA(BT_DATA_SVC_DATA16, svc_data, svc_data_len);
-    ad1[2] = ad0;
-
-    int err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY,
-                              ad1, ARRAY_SIZE(ad),
-                              sd, ARRAY_SIZE(sd));
-    if (err) {
-        LOG_INF("Advertising failed to start (err %d)", err);
-    }
 }
-
 
 static void validate_configuration(void)
 {
-	BUILD_ASSERT(ARRAY_SIZE(ml_result_led_effects) >= 1);
-	__ASSERT_NO_MSG(!is_led_effect_blocking(&DEFAULT_EFFECT->effect));
-	__ASSERT_NO_MSG(!DEFAULT_EFFECT->label);
+    BUILD_ASSERT(ARRAY_SIZE(ml_result_led_effects) >= 1);
+    __ASSERT_NO_MSG(!is_led_effect_blocking(&DEFAULT_EFFECT->effect));
+    __ASSERT_NO_MSG(!DEFAULT_EFFECT->label);
 
-	size_t anomaly_label_cnt = 0;
+    size_t anomaly_label_cnt = 0;
 
-	for (size_t i = 1; i < ARRAY_SIZE(ml_result_led_effects); i++) {
-		const struct ml_result_led_effect *t = &ml_result_led_effects[i];
+    for (size_t i = 1; i < ARRAY_SIZE(ml_result_led_effects); i++) {
+        const struct ml_result_led_effect *t = &ml_result_led_effects[i];
 
-		__ASSERT_NO_MSG(is_led_effect_valid(&t->effect));
-		__ASSERT_NO_MSG(t->label);
+        __ASSERT_NO_MSG(is_led_effect_valid(&t->effect));
+        __ASSERT_NO_MSG(t->label);
 
-		if (!strcmp(t->label, ANOMALY_LABEL)) {
-			anomaly_label_cnt++;
-		}
-	}
+        if (!strcmp(t->label, ANOMALY_LABEL)) {
+            anomaly_label_cnt++;
+        }
+    }
 
-	__ASSERT_NO_MSG(anomaly_label_cnt <= 1);
+    __ASSERT_NO_MSG(anomaly_label_cnt <= 1);
 }
 
 static bool handle_ml_result_event(const struct ml_result_event *event)
 {
     if ((ml_app_mode == ML_APP_MODE_MODEL_RUNNING) && !blocking_led_effect) {
-        update_ml_result(event->label,
-                         event->value,
-                         event->anomaly,
-                         event->dsp_time,
-                         event->classification_time,
-                         event->anomaly_time);
+        update_ml_result(event->label, event->value, event->anomaly);
     }
+
     return false;
 }
 
-
 static bool handle_sensor_sim_event(const struct sensor_sim_event *event)
 {
-	display_sensor_sim(event->label);
+    display_sensor_sim(event->label);
 
-	return false;
+    return false;
 }
 
 static bool handle_ei_data_forwarder_event(const struct ei_data_forwarder_event *event)
 {
-	__ASSERT_NO_MSG(event->state != EI_DATA_FORWARDER_STATE_DISABLED);
-	forwarder_state = event->state;
+    __ASSERT_NO_MSG(event->state != EI_DATA_FORWARDER_STATE_DISABLED);
+    forwarder_state = event->state;
 
-	__ASSERT_NO_MSG(is_led_effect_valid(&ei_data_forwarder_led_effects[forwarder_state]));
+    __ASSERT_NO_MSG(is_led_effect_valid(&ei_data_forwarder_led_effects[forwarder_state]));
 
-	if (ml_app_mode == ML_APP_MODE_DATA_FORWARDING) {
-		send_led_event(led_map[LED_ID_ML_STATE],
-			       &ei_data_forwarder_led_effects[forwarder_state]);
-	}
+    if (ml_app_mode == ML_APP_MODE_DATA_FORWARDING) {
+        send_led_event(led_map[LED_ID_ML_STATE],
+                       &ei_data_forwarder_led_effects[forwarder_state]);
+    }
 
-	return false;
+    return false;
 }
 
 static bool handle_led_ready_event(const struct led_ready_event *event)
 {
-	if ((event->led_id == led_map[LED_ID_ML_STATE]) &&
-	    (ml_app_mode == ML_APP_MODE_MODEL_RUNNING) &&
-	    (blocking_led_effect == event->led_effect)) {
-		display_ml_result(NULL, true);
-	}
+    if ((event->led_id == led_map[LED_ID_ML_STATE]) &&
+        (ml_app_mode == ML_APP_MODE_MODEL_RUNNING) &&
+        (blocking_led_effect == event->led_effect)) {
+        display_ml_result(NULL, true);
+    }
 
-	return false;
+    return false;
 }
 
 static bool handle_ml_app_mode_event(const struct ml_app_mode_event *event)
 {
-	ml_app_mode = event->mode;
+    ml_app_mode = event->mode;
 
-	if (event->mode == ML_APP_MODE_MODEL_RUNNING) {
-		clear_prediction();
-		display_ml_result(NULL, true);
-	} else if (event->mode == ML_APP_MODE_DATA_FORWARDING) {
-		send_led_event(led_map[LED_ID_ML_STATE],
-			       &ei_data_forwarder_led_effects[forwarder_state]);
-	} else {
-		/* Not supported. */
-		__ASSERT_NO_MSG(false);
-	}
+    if (event->mode == ML_APP_MODE_MODEL_RUNNING) {
+        clear_prediction();
+        display_ml_result(NULL, true);
+    } else if (event->mode == ML_APP_MODE_DATA_FORWARDING) {
+        send_led_event(led_map[LED_ID_ML_STATE],
+                       &ei_data_forwarder_led_effects[forwarder_state]);
+    } else {
+        /* Not supported. */
+        __ASSERT_NO_MSG(false);
+    }
 
-	return false;
+    return false;
 }
 
 static bool handle_module_state_event(const struct module_state_event *event)
 {
-	if (check_state(event, MODULE_ID(main), MODULE_STATE_READY)) {
-		if (IS_ENABLED(CONFIG_ASSERT)) {
-			validate_configuration();
-		} else {
-			ARG_UNUSED(is_led_effect_valid);
-		}
+    if (check_state(event, MODULE_ID(main), MODULE_STATE_READY)) {
+        if (IS_ENABLED(CONFIG_ASSERT)) {
+            validate_configuration();
+        } else {
+            ARG_UNUSED(is_led_effect_valid);
+        }
 
-		static bool initialized;
+        static bool initialized;
 
-		__ASSERT_NO_MSG(!initialized);
-		module_set_state(MODULE_STATE_READY);
-		initialized = true;
-		ml_result_set_signin_state(true);
-	}
+        __ASSERT_NO_MSG(!initialized);
+        module_set_state(MODULE_STATE_READY);
+        initialized = true;
+        ml_result_set_signin_state(true);
+    }
 
-	return false;
+    return false;
 }
 
 static bool app_event_handler(const struct app_event_header *aeh)
 {
-	if (DISPLAY_ML_RESULTS &&
-	    is_ml_result_event(aeh)) {
-		return handle_ml_result_event(cast_ml_result_event(aeh));
-	}
+    if (DISPLAY_ML_RESULTS &&
+        is_ml_result_event(aeh)) {
+        return handle_ml_result_event(cast_ml_result_event(aeh));
+    }
 
-	if (DISPLAY_SIM_SIGNAL &&
-	    is_sensor_sim_event(aeh)) {
-		return handle_sensor_sim_event(cast_sensor_sim_event(aeh));
-	}
+    if (DISPLAY_SIM_SIGNAL &&
+        is_sensor_sim_event(aeh)) {
+        return handle_sensor_sim_event(cast_sensor_sim_event(aeh));
+    }
 
-	if (DISPLAY_DATA_FORWARDER &&
-	    is_ei_data_forwarder_event(aeh)) {
-		return handle_ei_data_forwarder_event(cast_ei_data_forwarder_event(aeh));
-	}
+    if (DISPLAY_DATA_FORWARDER &&
+        is_ei_data_forwarder_event(aeh)) {
+        return handle_ei_data_forwarder_event(cast_ei_data_forwarder_event(aeh));
+    }
 
-	if (is_led_ready_event(aeh)) {
-		return handle_led_ready_event(cast_led_ready_event(aeh));
-	}
+    if (is_led_ready_event(aeh)) {
+        return handle_led_ready_event(cast_led_ready_event(aeh));
+    }
 
-	if (is_ml_app_mode_event(aeh)) {
-		return handle_ml_app_mode_event(cast_ml_app_mode_event(aeh));
-	}
+    if (is_ml_app_mode_event(aeh)) {
+        return handle_ml_app_mode_event(cast_ml_app_mode_event(aeh));
+    }
 
-	if (is_module_state_event(aeh)) {
-		return handle_module_state_event(cast_module_state_event(aeh));
-	}
+    if (is_module_state_event(aeh)) {
+        return handle_module_state_event(cast_module_state_event(aeh));
+    }
 
-	/* If event is unhandled, unsubscribe. */
-	__ASSERT_NO_MSG(false);
+    /* If event is unhandled, unsubscribe. */
+    __ASSERT_NO_MSG(false);
 
-	return false;
+    return false;
 }
 
 APP_EVENT_LISTENER(MODULE, app_event_handler);
