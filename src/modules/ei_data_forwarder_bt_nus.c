@@ -7,6 +7,8 @@
 #include <zephyr/kernel.h>
 #include <bluetooth/services/nus.h>
 #include <stdio.h>                     // for snprintf
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h> 
 
 #include "ei_data_forwarder.h"
 #include "ei_data_forwarder_event.h"
@@ -73,6 +75,26 @@ static atomic_t sent_cnt;
 // Forward declarations for helpers used below
 static bool is_nus_conn_valid(struct bt_conn *conn, uint8_t conn_state);
 static int send_packet(struct bt_conn *conn, uint8_t *buf, size_t size);
+
+// Log local Bluetooth identity address(es) over RTT.
+// This tells us the MAC we must use from the PC.
+static void log_bt_identities(void)
+{
+    bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+    size_t count = ARRAY_SIZE(addrs);
+
+    bt_id_get(addrs, &count);
+    LOG_INF("bt_id_get: count=%u", (unsigned int)count);
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+
+    for (size_t i = 0; i < count; i++) {
+        bt_addr_le_to_str(&addrs[i], addr_str, sizeof(addr_str));
+        LOG_INF("Local BT identity %u: %s",
+                (unsigned int)i, addr_str);
+    }
+}
+
 
 // send a single ML result as text via NUS.
 // Format: "<label>;<dsp_ms>;<cls_ms>;<anom_ms>"
@@ -383,12 +405,16 @@ static void init(void)
 
 static bool handle_module_state_event(const struct module_state_event *event)
 {
-	if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
-		init();
-	}
+    if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
+        /* Log local MAC once Bluetooth is ready */
+        log_bt_identities();
 
-	return false;
+        init();
+    }
+
+    return false;
 }
+
 
 static bool handle_ble_peer_event(const struct ble_peer_event *event)
 {
