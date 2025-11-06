@@ -6,6 +6,9 @@
 
 #include <zephyr/kernel.h>
 #include <bluetooth/services/nus.h>
+#include <stdio.h>                     // for snprintf
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/bluetooth/hci.h> 
 
 #include "ei_data_forwarder.h"
 #include "ei_data_forwarder_event.h"
@@ -13,6 +16,8 @@
 #include <caf/events/ble_common_event.h>
 #include <caf/events/sensor_event.h>
 #include "ml_app_mode_event.h"
+#include "ml_result_event.h"           // ML result events
+
 
 #define MODULE ei_data_forwarder
 #include <caf/events/module_state_event.h>
@@ -67,6 +72,81 @@ static struct k_work send_queued;
 static size_t pipeline_cnt;
 static atomic_t sent_cnt;
 
+// Forward declarations for helpers used below
+static bool is_nus_conn_valid(struct bt_conn *conn, uint8_t conn_state);
+static int send_packet(struct bt_conn *conn, uint8_t *buf, size_t size);
+
+// Log local Bluetooth identity address(es) over RTT.
+// This tells us the MAC we must use from the PC.
+static void log_bt_identities(void)
+{
+    bt_addr_le_t addrs[CONFIG_BT_ID_MAX];
+    size_t count = ARRAY_SIZE(addrs);
+
+    bt_id_get(addrs, &count);
+    LOG_INF("bt_id_get: count=%u", (unsigned int)count);
+
+    char addr_str[BT_ADDR_LE_STR_LEN];
+
+    for (size_t i = 0; i < count; i++) {
+        bt_addr_le_to_str(&addrs[i], addr_str, sizeof(addr_str));
+        LOG_INF("Local BT identity %u: %s",
+                (unsigned int)i, addr_str);
+    }
+}
+
+
+// send a single ML result as text via NUS.
+// Format: "<label>;<dsp_ms>;<cls_ms>;<anom_ms>"
+// Example: "idle;0;5;-1"
+static bool handle_ml_result_event(const struct ml_result_event *event)
+{
+    /* Only send if we have a valid NUS connection
+     * (conn != NULL + notifications enabled).
+     */
+    if (!is_nus_conn_valid(nus_conn, conn_state)) {
+        return false;
+    }
+
+    const char *label = event->label ? event->label : "unknown";
+
+    char msg[48];
+    int len = snprintf(msg, sizeof(msg), "%s;%d;%d;%d",
+                       label,
+                       event->dsp_time,
+                       event->classification_time,
+                       event->anomaly_time);
+
+    if (len <= 0) {
+        return false;
+    }
+    /* Clamp to buffer size (don’t send the trailing '\0'). */
+    if (len >= (int)sizeof(msg)) {
+        len = (int)sizeof(msg) - 1;
+    }
+
+    /* Share the same pipeline counter as sensor packets. */
+    if (pipeline_cnt >= PIPELINE_MAX_CNT) {
+        LOG_WRN("Dropping ML result: NUS pipeline full");
+        return false;
+    }
+
+    int err = send_packet(nus_conn, (uint8_t *)msg, (size_t)len);
+    if (err) {
+        LOG_WRN("Failed to send ML result over NUS: %d", err);
+        return false;
+    }
+
+    /* Match what the sensor path does: we have one more
+     * in-flight packet that bt_nus_sent_cb/send_queued_fn
+     * will eventually retire.
+     */
+    pipeline_cnt++;
+
+    return false;
+}
+
+
 
 static void broadcast_ei_data_forwarder_state(enum ei_data_forwarder_state forwarder_state)
 {
@@ -80,23 +160,19 @@ static void broadcast_ei_data_forwarder_state(enum ei_data_forwarder_state forwa
 
 static bool is_nus_conn_valid(struct bt_conn *conn, uint8_t conn_state)
 {
-	if (!conn) {
-		return false;
-	}
+    if (!conn) {
+        return false;
+    }
 
-	if (!(conn_state & CONN_INTERVAL_VALID)) {
-		return false;
-	}
+    /* For talking to a PC / Bleak script we don’t require
+     * encryption or a specific connection interval – we just
+     * need notifications to be enabled.
+     */
+    if (!(conn_state & CONN_SUBSCRIBED)) {
+        return false;
+    }
 
-	if (!(conn_state & CONN_SECURED)) {
-		return false;
-	}
-
-	if (!(conn_state & CONN_SUBSCRIBED)) {
-		return false;
-	}
-
-	return true;
+    return true;
 }
 
 static void update_state(enum state new_state)
@@ -342,12 +418,16 @@ static void init(void)
 
 static bool handle_module_state_event(const struct module_state_event *event)
 {
-	if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
-		init();
-	}
+    if (check_state(event, MODULE_ID(ble_state), MODULE_STATE_READY)) {
+        /* Log local MAC once Bluetooth is ready */
+        log_bt_identities();
 
-	return false;
+        init();
+    }
+
+    return false;
 }
+
 
 static bool handle_ble_peer_event(const struct ble_peer_event *event)
 {
@@ -409,38 +489,45 @@ static bool handle_ble_peer_conn_params_event(const struct ble_peer_conn_params_
 
 static bool app_event_handler(const struct app_event_header *aeh)
 {
-	if (is_sensor_event(aeh)) {
-		return handle_sensor_event(cast_sensor_event(aeh));
-	}
+    if (is_sensor_event(aeh)) {
+        return handle_sensor_event(cast_sensor_event(aeh));
+    }
 
-	if (ML_APP_MODE_CONTROL &&
-	    is_ml_app_mode_event(aeh)) {
-		return handle_ml_app_mode_event(cast_ml_app_mode_event(aeh));
-	}
+    if (is_ml_result_event(aeh)) {
+        /* forward ML results over NUS */
+        return handle_ml_result_event(cast_ml_result_event(aeh));
+    }
 
-	if (is_module_state_event(aeh)) {
-		return handle_module_state_event(cast_module_state_event(aeh));
-	}
+    if (ML_APP_MODE_CONTROL &&
+        is_ml_app_mode_event(aeh)) {
+        return handle_ml_app_mode_event(cast_ml_app_mode_event(aeh));
+    }
 
-	if (is_ble_peer_event(aeh)) {
-		return handle_ble_peer_event(cast_ble_peer_event(aeh));
-	}
+    if (is_module_state_event(aeh)) {
+        return handle_module_state_event(cast_module_state_event(aeh));
+    }
 
-	if (is_ble_peer_conn_params_event(aeh)) {
-		return handle_ble_peer_conn_params_event(cast_ble_peer_conn_params_event(aeh));
-	}
+    if (is_ble_peer_event(aeh)) {
+        return handle_ble_peer_event(cast_ble_peer_event(aeh));
+    }
 
-	/* If event is unhandled, unsubscribe. */
-	__ASSERT_NO_MSG(false);
+    if (is_ble_peer_conn_params_event(aeh)) {
+        return handle_ble_peer_conn_params_event(cast_ble_peer_conn_params_event(aeh));
+    }
 
-	return false;
+    /* If event is unhandled, unsubscribe. */
+    __ASSERT_NO_MSG(false);
+
+    return false;
 }
+
 
 APP_EVENT_LISTENER(MODULE, app_event_handler);
 APP_EVENT_SUBSCRIBE(MODULE, module_state_event);
 APP_EVENT_SUBSCRIBE(MODULE, sensor_event);
 APP_EVENT_SUBSCRIBE(MODULE, ble_peer_event);
 APP_EVENT_SUBSCRIBE(MODULE, ble_peer_conn_params_event);
+APP_EVENT_SUBSCRIBE(MODULE, ml_result_event);
 #if ML_APP_MODE_CONTROL
 APP_EVENT_SUBSCRIBE(MODULE, ml_app_mode_event);
 #endif /* ML_APP_MODE_CONTROL */
