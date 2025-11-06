@@ -101,7 +101,9 @@ static void log_bt_identities(void)
 // Example: "idle;0;5;-1"
 static bool handle_ml_result_event(const struct ml_result_event *event)
 {
-    /* Only send if we have a valid NUS connection and notifications enabled */
+    /* Only send if we have a valid NUS connection
+     * (conn != NULL + notifications enabled).
+     */
     if (!is_nus_conn_valid(nus_conn, conn_state)) {
         return false;
     }
@@ -118,17 +120,32 @@ static bool handle_ml_result_event(const struct ml_result_event *event)
     if (len <= 0) {
         return false;
     }
-    if ((size_t)len > sizeof(msg)) {
-        len = sizeof(msg);
+    /* Clamp to buffer size (don’t send the trailing '\0'). */
+    if (len >= (int)sizeof(msg)) {
+        len = (int)sizeof(msg) - 1;
+    }
+
+    /* Share the same pipeline counter as sensor packets. */
+    if (pipeline_cnt >= PIPELINE_MAX_CNT) {
+        LOG_WRN("Dropping ML result: NUS pipeline full");
+        return false;
     }
 
     int err = send_packet(nus_conn, (uint8_t *)msg, (size_t)len);
     if (err) {
         LOG_WRN("Failed to send ML result over NUS: %d", err);
+        return false;
     }
+
+    /* Match what the sensor path does: we have one more
+     * in-flight packet that bt_nus_sent_cb/send_queued_fn
+     * will eventually retire.
+     */
+    pipeline_cnt++;
 
     return false;
 }
+
 
 
 static void broadcast_ei_data_forwarder_state(enum ei_data_forwarder_state forwarder_state)
@@ -143,23 +160,19 @@ static void broadcast_ei_data_forwarder_state(enum ei_data_forwarder_state forwa
 
 static bool is_nus_conn_valid(struct bt_conn *conn, uint8_t conn_state)
 {
-	if (!conn) {
-		return false;
-	}
+    if (!conn) {
+        return false;
+    }
 
-	if (!(conn_state & CONN_INTERVAL_VALID)) {
-		return false;
-	}
+    /* For talking to a PC / Bleak script we don’t require
+     * encryption or a specific connection interval – we just
+     * need notifications to be enabled.
+     */
+    if (!(conn_state & CONN_SUBSCRIBED)) {
+        return false;
+    }
 
-	if (!(conn_state & CONN_SECURED)) {
-		return false;
-	}
-
-	if (!(conn_state & CONN_SUBSCRIBED)) {
-		return false;
-	}
-
-	return true;
+    return true;
 }
 
 static void update_state(enum state new_state)
