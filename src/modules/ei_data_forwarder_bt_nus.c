@@ -6,6 +6,7 @@
 
 #include <zephyr/kernel.h>
 #include <bluetooth/services/nus.h>
+#include <stdio.h>                     // for snprintf
 
 #include "ei_data_forwarder.h"
 #include "ei_data_forwarder_event.h"
@@ -13,6 +14,8 @@
 #include <caf/events/ble_common_event.h>
 #include <caf/events/sensor_event.h>
 #include "ml_app_mode_event.h"
+#include "ml_result_event.h"           // ML result events
+
 
 #define MODULE ei_data_forwarder
 #include <caf/events/module_state_event.h>
@@ -66,6 +69,44 @@ static sys_slist_t send_queue;
 static struct k_work send_queued;
 static size_t pipeline_cnt;
 static atomic_t sent_cnt;
+
+// Forward declarations for helpers used below
+static bool is_nus_conn_valid(struct bt_conn *conn, uint8_t conn_state);
+static int send_packet(struct bt_conn *conn, uint8_t *buf, size_t size);
+
+// send a single ML result as text via NUS.
+// Format: "<label>;<dsp_ms>;<cls_ms>;<anom_ms>"
+// Example: "idle;0;5;-1"
+static bool handle_ml_result_event(const struct ml_result_event *event)
+{
+    /* Only send if we have a valid NUS connection and notifications enabled */
+    if (!is_nus_conn_valid(nus_conn, conn_state)) {
+        return false;
+    }
+
+    const char *label = event->label ? event->label : "unknown";
+
+    char msg[48];
+    int len = snprintf(msg, sizeof(msg), "%s;%d;%d;%d",
+                       label,
+                       event->dsp_time,
+                       event->classification_time,
+                       event->anomaly_time);
+
+    if (len <= 0) {
+        return false;
+    }
+    if ((size_t)len > sizeof(msg)) {
+        len = sizeof(msg);
+    }
+
+    int err = send_packet(nus_conn, (uint8_t *)msg, (size_t)len);
+    if (err) {
+        LOG_WRN("Failed to send ML result over NUS: %d", err);
+    }
+
+    return false;
+}
 
 
 static void broadcast_ei_data_forwarder_state(enum ei_data_forwarder_state forwarder_state)
@@ -409,38 +450,45 @@ static bool handle_ble_peer_conn_params_event(const struct ble_peer_conn_params_
 
 static bool app_event_handler(const struct app_event_header *aeh)
 {
-	if (is_sensor_event(aeh)) {
-		return handle_sensor_event(cast_sensor_event(aeh));
-	}
+    if (is_sensor_event(aeh)) {
+        return handle_sensor_event(cast_sensor_event(aeh));
+    }
 
-	if (ML_APP_MODE_CONTROL &&
-	    is_ml_app_mode_event(aeh)) {
-		return handle_ml_app_mode_event(cast_ml_app_mode_event(aeh));
-	}
+    if (is_ml_result_event(aeh)) {
+        /* forward ML results over NUS */
+        return handle_ml_result_event(cast_ml_result_event(aeh));
+    }
 
-	if (is_module_state_event(aeh)) {
-		return handle_module_state_event(cast_module_state_event(aeh));
-	}
+    if (ML_APP_MODE_CONTROL &&
+        is_ml_app_mode_event(aeh)) {
+        return handle_ml_app_mode_event(cast_ml_app_mode_event(aeh));
+    }
 
-	if (is_ble_peer_event(aeh)) {
-		return handle_ble_peer_event(cast_ble_peer_event(aeh));
-	}
+    if (is_module_state_event(aeh)) {
+        return handle_module_state_event(cast_module_state_event(aeh));
+    }
 
-	if (is_ble_peer_conn_params_event(aeh)) {
-		return handle_ble_peer_conn_params_event(cast_ble_peer_conn_params_event(aeh));
-	}
+    if (is_ble_peer_event(aeh)) {
+        return handle_ble_peer_event(cast_ble_peer_event(aeh));
+    }
 
-	/* If event is unhandled, unsubscribe. */
-	__ASSERT_NO_MSG(false);
+    if (is_ble_peer_conn_params_event(aeh)) {
+        return handle_ble_peer_conn_params_event(cast_ble_peer_conn_params_event(aeh));
+    }
 
-	return false;
+    /* If event is unhandled, unsubscribe. */
+    __ASSERT_NO_MSG(false);
+
+    return false;
 }
+
 
 APP_EVENT_LISTENER(MODULE, app_event_handler);
 APP_EVENT_SUBSCRIBE(MODULE, module_state_event);
 APP_EVENT_SUBSCRIBE(MODULE, sensor_event);
 APP_EVENT_SUBSCRIBE(MODULE, ble_peer_event);
 APP_EVENT_SUBSCRIBE(MODULE, ble_peer_conn_params_event);
+APP_EVENT_SUBSCRIBE(MODULE, ml_result_event);
 #if ML_APP_MODE_CONTROL
 APP_EVENT_SUBSCRIBE(MODULE, ml_app_mode_event);
 #endif /* ML_APP_MODE_CONTROL */

@@ -42,46 +42,6 @@ static const struct led_effect *blocking_led_effect;
 static const char *cur_label;
 static size_t prediction_streak;
 
-//vinh
-#define DEVICE_NAME1 "CPS22"
-#define DEVICE_NAME_LEN (sizeof(DEVICE_NAME1) - 1)
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0xaa, 0xfe),
-	BT_DATA_BYTES(BT_DATA_SVC_DATA16,
-		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't',
-		      0x08) /* .org */
-};
-
-static struct bt_data ad3[]={
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_MANUFACTURER_DATA, 0xfe, 0xfe)
-
-};
-
-static struct bt_data ad1[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, BT_LE_AD_NO_BREDR),
-	BT_DATA_BYTES(BT_DATA_UUID16_ALL, 0xaa, 0xfe),
-	BT_DATA_BYTES(BT_DATA_SVC_DATA16,
-		      0xaa, 0xfe, /* Eddystone UUID */
-		      0x10, /* Eddystone-URL frame type */
-		      0x00, /* Calibrated Tx power at 0m */
-		      0x00, /* URL Scheme Prefix http://www. */
-		      'z', 'e', 'p', 'h', 'y', 'r',
-		      'p', 'r', 'o', 'j', 'e', 'c', 't',
-		      0x08) /* .org */
-};
-/* Set Scan Response data */
-static const struct bt_data sd[] = {
-	BT_DATA(BT_DATA_NAME_COMPLETE, DEVICE_NAME1, DEVICE_NAME_LEN),
-	//BT_DATA(BT_DATA_NAME_SHORTENED, DEVICE_NAME1, DEVICE_NAME_LEN),
-};
-
 
 //vinh2
 //add timer counter
@@ -221,43 +181,7 @@ static void display_ml_result(const char *label, bool force_update)
 static void update_ml_result(const char *label, float value, float anomaly,
                              int dsptime, int classification_time, int anomaly_time)
 {
-    /* ------- Build your service-data payload (unchanged logic) ------- */
-    static uint8_t adata[64] = {
-        0xaa, 0xfe,       /* Eddystone UUID */
-        0x10,             /* Eddystone-URL frame type */
-        0x00,             /* Calibrated Tx power at 0m */
-        0x00,             /* URL Scheme Prefix */
-        'z','e','p','h','y','r','p','r','o','j','e','c','t','s',
-        0x08              /* .org */
-    };
-    static uint8_t adatasize = 19;
-
-    /* Compose short ASCII payload: "<label>;<dsp>;<cls>;<anom>" */
-    char rs[40];
-    char snum[16];
-
-    rs[0] = '\0';
-    if (label) { strncat(rs, label, sizeof(rs) - 1); }
-    strncat(rs, ";", sizeof(rs) - 1);
-
-    snprintf(snum, sizeof(snum), "%d", (int)dsptime);
-    strncat(rs, snum, sizeof(rs) - 1);
-    strncat(rs, ";", sizeof(rs) - 1);
-
-    snprintf(snum, sizeof(snum), "%d", (int)classification_time);
-    strncat(rs, snum, sizeof(rs) - 1);
-    strncat(rs, ";", sizeof(rs) - 1);
-
-    snprintf(snum, sizeof(snum), "%d", (int)anomaly_time);
-    strncat(rs, snum, sizeof(rs) - 1);
-
-    const int l = MIN((int)strlen(rs), (int)sizeof(adata) - 5);
-    for (int i = 0; i < l; i++) {
-        adata[i + 5] = (uint8_t)rs[i];
-    }
-    adatasize = 5 + (uint8_t)l;
-
-    /* ------- Classification acceptance & LED label selection ------- */
+    /* -------- Classification acceptance & LED label selection -------- */
     /* Treat “no anomaly block” as anomaly = -1.0f (sentinel from ml_runner) */
     const bool anomaly_available = (anomaly >= 0.0f);
 
@@ -265,20 +189,23 @@ static void update_ml_result(const char *label, float value, float anomaly,
     bool accept = false;
 
     if (anomaly_available && (anomaly > ANOMALY_THRESH)) {
+        /* High anomaly → use special ANOMALY label/effect */
         new_label = ANOMALY_LABEL;
         accept = true;
     } else if (value >= VALUE_THRESH) {
+        /* Normal high-confidence prediction */
         new_label = label;
         accept = true;
     } else if (!anomaly_available) {
-        /* Requested behavior: without anomaly, low-confidence → idle/unknown. */
-        new_label = "idle";         /* or set to NULL to use the default effect */
+        /* Model without anomaly block: treat low-confidence as idle */
+        new_label = "idle";
         accept = true;
     } else {
-        /* Low confidence with anomaly available: ignore this frame. */
+        /* Low confidence, anomaly available → ignore this frame */
         accept = false;
     }
 
+    /* Track streak of identical labels */
     if (new_label != cur_label) {
         if ((!new_label || !cur_label) || strcmp(new_label, cur_label)) {
             cur_label = new_label;
@@ -291,44 +218,14 @@ static void update_ml_result(const char *label, float value, float anomaly,
     }
 
     if (prediction_streak >= PREDICTION_STREAK_THRESH) {
+        /* Only show on LEDs once we've seen enough consistent predictions */
         display_ml_result(cur_label, false);
         clear_prediction();
     }
 
-    /* ------- Continuous advertising: update payload, don’t stop/start ------- */
-    /* Use the existing 'ad1' + 'sd' defined earlier in this file. */
-    static bool adv_started;
-    static int64_t adv_last_update_ms;
-    const int64_t now = k_uptime_get();
-    const int64_t ADV_MIN_UPDATE_MS = 100;
-    struct bt_data svc = BT_DATA(BT_DATA_SVC_DATA16, adata, adatasize);
-
-    if (!adv_started) {
-        ad1[2] = svc; /* service-data in the 3rd slot */
-        int err = bt_le_adv_start(BT_LE_ADV_NCONN_IDENTITY,
-                                  ad1, ARRAY_SIZE(ad1),
-                                  sd, ARRAY_SIZE(sd));
-        if (err) {
-            LOG_WRN("bt_le_adv_start failed (%d)", err);
-            return;
-        }
-        adv_started = true;
-        adv_last_update_ms = now;
-        return;
-    } else{ // Advertise immediately
-		ad1[2] = svc;
-        int err = bt_le_adv_update_data(ad1, ARRAY_SIZE(ad1),
-                                        sd, ARRAY_SIZE(sd));
-        if (err) {
-            LOG_WRN("bt_le_adv_update_data failed (%d)", err);
-        } else {
-			LOG_INF("Update adv data after %d ms", now - adv_last_update_ms);
-            adv_last_update_ms = now;
-        }
-	}
-
-        
+    /* No BLE advertising here anymore – NUS module will send results. */
 }
+
 
 
 static void validate_configuration(void)
