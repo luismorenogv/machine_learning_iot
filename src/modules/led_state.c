@@ -315,18 +315,19 @@ static void update_ml_result(const char *label, float value, float anomaly,
         adv_started = true;
         adv_last_update_ms = now;
         return;
-    }
-
-    if (now - adv_last_update_ms >= ADV_MIN_UPDATE_MS) {
-        ad1[2] = svc;
+    } else{ // Advertise immediately
+		ad1[2] = svc;
         int err = bt_le_adv_update_data(ad1, ARRAY_SIZE(ad1),
                                         sd, ARRAY_SIZE(sd));
         if (err) {
             LOG_WRN("bt_le_adv_update_data failed (%d)", err);
         } else {
+			LOG_INF("Update adv data after %d ms", now - adv_last_update_ms);
             adv_last_update_ms = now;
         }
-    }
+	}
+
+        
 }
 
 
